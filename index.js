@@ -1,8 +1,4 @@
 const login = require("./module/login");
-
-// CommonJS default export
+// Support all method? :v
 module.exports = login;
-// Support require('{ login }') named import pattern
-module.exports.login = login;
-// Support ESM default import interop
-module.exports.default = login;
+Object.assign(module.exports, { login, default: login });
