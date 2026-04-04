@@ -1,56 +1,46 @@
 "use strict";
-/**
- * MQTT/WebSocket listener for Facebook Messenger real-time events.
- * Connects to edge-chat.facebook.com, subscribes to topics, parses deltas and typing/presence.
- */
+
 const { formatID } = require("../../../utils/format");
 
-const DEFAULT_RECONNECT_DELAY_MS = 2000;
-const T_MS_WAIT_TIMEOUT_MS = 5000;
+const DEFAULT_RECONNECT_DELAY = 2000;
+const T_MS_WAIT_TIMEOUT = 5000;
 
 module.exports = function createListenMqtt(deps) {
-  const { WebSocket, mqtt, HttpsProxyAgent, buildStream, buildProxy,
-    topics, parseDelta, getTaskResponseData, logger, emitAuth
+  const { 
+    WebSocket, mqtt, HttpsProxyAgent, buildStream, buildProxy,
+    topics, parseDelta, getTaskResponseData, logger, emitAuth 
   } = deps;
 
   return function listenMqtt(defaultFuncs, api, ctx, globalCallback) {
+    const chatOn = !!ctx.globalOptions.online;
+    const sessionID = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER) + 1;
+    const reconnectDelay = ctx._mqttOpt?.reconnectDelayMs || DEFAULT_RECONNECT_DELAY;
 
-    function scheduleReconnect(delayMs) {
-      const d = (ctx._mqttOpt && ctx._mqttOpt.reconnectDelayMs) || DEFAULT_RECONNECT_DELAY_MS;
-      const ms = typeof delayMs === "number" ? delayMs : d;
-      if (ctx._reconnectTimer) {
-        logger("mqtt reconnect already scheduled", "warn");
-        return; // debounce
-      }
-      if (ctx._ending) {
-        logger("mqtt reconnect skipped - ending", "warn");
-        return;
-      }
-      logger(`mqtt will reconnect in ${ms}ms`, "warn");
+    const safeDisconnect = () => {
+      try {
+        if (ctx.mqttClient?.connected) ctx.mqttClient.end(true);
+      } catch (_) {}
+    };
+
+    const scheduleReconnect = (delay = reconnectDelay) => {
+      if (ctx._reconnectTimer || ctx._ending) return;
+      
+      logger(`mqtt will reconnect in ${delay}ms`, "warn");
       ctx._reconnectTimer = setTimeout(() => {
         ctx._reconnectTimer = null;
-        if (!ctx._ending) {
-          listenMqtt(defaultFuncs, api, ctx, globalCallback);
-        }
-      }, ms);
-    }
-    function isEndingLikeError(msg) {
-      return /No subscription existed|client disconnecting|socket hang up|ECONNRESET/i.test(msg || "");
-    }
+        if (!ctx._ending) listenMqtt(defaultFuncs, api, ctx, globalCallback);
+      }, delay);
+    };
 
-    const chatOn = ctx.globalOptions.online;
-    const sessionID = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER) + 1;
+    const host = ctx.mqttEndpoint 
+      ? `${ctx.mqttEndpoint}&sid=${sessionID}&cid=${ctx.clientId}`
+      : `wss://edge-chat.facebook.com/chat?${ctx.region ? `region=${ctx.region.toLowerCase()}&` : ""}sid=${sessionID}&cid=${ctx.clientId}`;
+
     const username = {
       u: ctx.userID, s: sessionID, chat_on: chatOn, fg: false, d: ctx.clientId,
       ct: "websocket", aid: 219994525426954, aids: null, mqtt_sid: "",
       cp: 3, ecp: 10, st: [], pm: [], dc: "", no_auto_fg: true, gas: null, pack: [], p: null, php_override: ""
     };
-
-    const cookies = api.getCookies();
-    let host;
-    if (ctx.mqttEndpoint) host = `${ctx.mqttEndpoint}&sid=${sessionID}&cid=${ctx.clientId}`;
-    else if (ctx.region) host = `wss://edge-chat.facebook.com/chat?region=${ctx.region.toLowerCase()}&sid=${sessionID}&cid=${ctx.clientId}`;
-    else host = `wss://edge-chat.facebook.com/chat?sid=${sessionID}&cid=${ctx.clientId}`;
 
     const options = {
       clientId: "mqttwsclient",
@@ -58,201 +48,131 @@ module.exports = function createListenMqtt(deps) {
       protocolVersion: 3,
       username: JSON.stringify(username),
       clean: true,
+      keepalive: 30,
+      reschedulePings: true,
+      reconnectPeriod: 0,
+      connectTimeout: 5000,
       wsOptions: {
         headers: {
-          Cookie: cookies,
+          Cookie: api.getCookies(),
           Origin: "https://www.facebook.com",
           "User-Agent": ctx.globalOptions.userAgent || "Mozilla/5.0",
           Referer: "https://www.facebook.com/",
           Host: "edge-chat.facebook.com",
-          Connection: "Upgrade",
-          Pragma: "no-cache",
-          "Cache-Control": "no-cache",
-          Upgrade: "websocket",
-          "Sec-WebSocket-Version": "13",
-          "Accept-Encoding": "gzip, deflate, br",
-          "Accept-Language": "vi,en;q=0.9",
-          "Sec-WebSocket-Extensions": "permessage-deflate; client_max_window_bits"
         },
         origin: "https://www.facebook.com",
         protocolVersion: 13,
-        binaryType: "arraybuffer"
-      },
-      keepalive: 30,
-      reschedulePings: true,
-      reconnectPeriod: 0,
-      connectTimeout: 5000
+        binaryType: "arraybuffer",
+        agent: ctx.globalOptions.proxy ? new HttpsProxyAgent(ctx.globalOptions.proxy) : undefined
+      }
     };
-    if (ctx.globalOptions.proxy !== undefined) {
-      const agent = new HttpsProxyAgent(ctx.globalOptions.proxy);
-      options.wsOptions.agent = agent;
-    }
 
-    ctx.mqttClient = new mqtt.Client(
-      () => buildStream(options, new WebSocket(host, options.wsOptions), buildProxy()),
-      options
-    );
-    const mqttClient = ctx.mqttClient;
+    ctx.mqttClient = new mqtt.Client(() => buildStream(options, new WebSocket(host, options.wsOptions), buildProxy()), options);
+    const client = ctx.mqttClient;
 
-    mqttClient.on("error", function (err) {
-      const msg = String(err && err.message ? err.message : err || "");
-      if ((ctx._ending || ctx._cycling) && /No subscription existed|client disconnecting/i.test(msg)) {
-        logger(`mqtt expected during shutdown: ${msg}`, "info");
-        return;
-      }
-
-      if (/Not logged in|Not logged in.|blocked the login|401|403/i.test(msg)) {
-        try {
-          if (mqttClient && mqttClient.connected) {
-            mqttClient.end(true);
-          }
-        } catch (_) { }
-        return emitAuth(ctx, api, globalCallback,
-          /blocked/i.test(msg) ? "login_blocked" : "not_logged_in",
-          msg
-        );
-      }
-      logger(`mqtt error: ${msg}`, "error");
-      try {
-        if (mqttClient && mqttClient.connected) {
-          mqttClient.end(true);
-        }
-      } catch (_) { }
+    client.on("error", (err) => {
+      const msg = err?.message || String(err || "");
       if (ctx._ending || ctx._cycling) return;
 
-      if (ctx.globalOptions.autoReconnect && !ctx._ending) {
-        const d = (ctx._mqttOpt && ctx._mqttOpt.reconnectDelayMs) || DEFAULT_RECONNECT_DELAY_MS;
-        logger(`mqtt autoReconnect listenMqtt() in ${d}ms`, "warn");
-        scheduleReconnect(d);
-      } else {
-        globalCallback({ type: "stop_listen", error: msg || "Connection refused" }, null);
+      if (/Not logged in|blocked|401|403/i.test(msg)) {
+        safeDisconnect();
+        return emitAuth(ctx, api, globalCallback, /blocked/i.test(msg) ? "login_blocked" : "not_logged_in", msg);
       }
+
+      logger(`mqtt error: ${msg}`, "error");
+      safeDisconnect();
+
+      if (ctx.globalOptions.autoReconnect) scheduleReconnect();
+      else globalCallback({ type: "stop_listen", error: msg }, null);
     });
 
-    mqttClient.on("connect", function () {
-      if (process.env.OnStatus === undefined) {
-        logger("fca-unofficial", "info");
-        process.env.OnStatus = true;
+    client.on("connect", () => {
+      if (!process.env.OnStatus) {
+        logger("fca-unofficial - MQTT Connected", "info");
+        process.env.OnStatus = "true";
       }
       ctx._cycling = false;
+      topics.forEach(t => client.subscribe(t));
 
-      topics.forEach(t => mqttClient.subscribe(t));
-
-
-      const queue = {
+      const syncTopic = ctx.syncToken ? "/messenger_sync_get_diffs" : "/messenger_sync_create_queue";
+      const syncPayload = {
         sync_api_version: 11, max_deltas_able_to_process: 100, delta_batch_size: 500,
-        encoding: "JSON", entity_fbid: ctx.userID, initial_titan_sequence_id: ctx.lastSeqId, device_params: null
+        encoding: "JSON", entity_fbid: ctx.userID, initial_titan_sequence_id: ctx.lastSeqId,
+        ...(ctx.syncToken && { last_seq_id: ctx.lastSeqId, sync_token: ctx.syncToken })
       };
-      const topic = ctx.syncToken ? "/messenger_sync_get_diffs" : "/messenger_sync_create_queue";
-      if (ctx.syncToken) { queue.last_seq_id = ctx.lastSeqId; queue.sync_token = ctx.syncToken; }
-      mqttClient.publish(topic, JSON.stringify(queue), { qos: 1, retain: false });
-      mqttClient.publish("/foreground_state", JSON.stringify({ foreground: chatOn }), { qos: 1 });
-      mqttClient.publish("/set_client_settings", JSON.stringify({ make_user_available_when_in_foreground: true }), { qos: 1 });
-      const d = (ctx._mqttOpt && ctx._mqttOpt.reconnectDelayMs) || DEFAULT_RECONNECT_DELAY_MS;
-      let rTimeout = setTimeout(function () {
-        rTimeout = null;
-        if (ctx._ending) {
-          logger("mqtt t_ms timeout skipped - ending", "warn");
-          return;
-        }
-        logger(`mqtt t_ms timeout, cycling in ${d}ms`, "warn");
-        try {
-          if (mqttClient && mqttClient.connected) {
-            mqttClient.end(true);
-          }
-        } catch (_) { }
-        scheduleReconnect(d);
-      }, T_MS_WAIT_TIMEOUT_MS);
 
-      // Store timeout reference for cleanup
+      client.publish(syncTopic, JSON.stringify(syncPayload), { qos: 1 });
+      client.publish("/foreground_state", JSON.stringify({ foreground: chatOn }), { qos: 1 });
+
+      let rTimeout = setTimeout(() => {
+        if (ctx._ending) return;
+        logger("mqtt t_ms timeout, cycling...", "warn");
+        safeDisconnect();
+        scheduleReconnect();
+      }, T_MS_WAIT_TIMEOUT);
+
       ctx._rTimeout = rTimeout;
-
-      ctx.tmsWait = function () {
-        if (rTimeout) {
-          clearTimeout(rTimeout);
-          rTimeout = null;
-        }
-        if (ctx._rTimeout) {
-          delete ctx._rTimeout;
-        }
+      ctx.tmsWait = () => {
+        clearTimeout(rTimeout);
+        delete ctx._rTimeout;
         if (ctx.globalOptions.emitReady) globalCallback({ type: "ready", error: null });
         delete ctx.tmsWait;
       };
     });
 
-    mqttClient.on("message", function (topic, message) {
-      if (ctx._ending) return; // Ignore messages if ending
+    client.on("message", (topic, rawMessage) => {
+      if (ctx._ending) return;
+      
       try {
-        let jsonMessage = Buffer.isBuffer(message) ? Buffer.from(message).toString() : message;
-        try {
-          jsonMessage = JSON.parse(jsonMessage);
-        } catch (parseErr) {
-          logger(`mqtt message parse error for topic ${topic}: ${parseErr && parseErr.message ? parseErr.message : String(parseErr)}`, "warn");
-          jsonMessage = {};
-        }
+        const message = JSON.parse(Buffer.isBuffer(rawMessage) ? rawMessage.toString() : rawMessage);
 
-        if (jsonMessage.type === "jewel_requests_add") {
-          globalCallback(null, { type: "friend_request_received", actorFbId: jsonMessage.from.toString(), timestamp: Date.now().toString() });
-        } else if (jsonMessage.type === "jewel_requests_remove_old") {
-          globalCallback(null, { type: "friend_request_cancel", actorFbId: jsonMessage.from.toString(), timestamp: Date.now().toString() });
-        } else if (topic === "/t_ms") {
-          if (ctx.tmsWait && typeof ctx.tmsWait == "function") ctx.tmsWait();
-          if (jsonMessage.firstDeltaSeqId && jsonMessage.syncToken) {
-            ctx.lastSeqId = jsonMessage.firstDeltaSeqId;
-            ctx.syncToken = jsonMessage.syncToken;
-          }
-          if (jsonMessage.lastIssuedSeqId) ctx.lastSeqId = parseInt(jsonMessage.lastIssuedSeqId);
-          for (const dlt of (jsonMessage.deltas || [])) {
-            parseDelta(defaultFuncs, api, ctx, globalCallback, { delta: dlt });
-          }
-        } else if (topic === "/thread_typing" || topic === "/orca_typing_notifications") {
-          const typ = {
-            type: "typ",
-            isTyping: !!jsonMessage.state,
-            from: jsonMessage.sender_fbid.toString(),
-            threadID: formatID((jsonMessage.thread || jsonMessage.sender_fbid).toString())
-          };
-          globalCallback(null, typ);
-        } else if (topic === "/orca_presence") {
-          if (!ctx.globalOptions.updatePresence) {
-            for (const data of (jsonMessage.list || [])) {
-              const presence = { type: "presence", userID: String(data.u), timestamp: data.l * 1000, statuses: data.p };
-              globalCallback(null, presence);
+        switch (topic) {
+          case "/t_ms":
+            if (ctx.tmsWait) ctx.tmsWait();
+            if (message.firstDeltaSeqId && message.syncToken) {
+              ctx.lastSeqId = message.firstDeltaSeqId;
+              ctx.syncToken = message.syncToken;
             }
-          }
-        } else if (topic === "/ls_resp") {
-          const parsedPayload = JSON.parse(jsonMessage.payload);
-          const reqID = jsonMessage.request_id;
-          const tasks = ctx.tasks;
-          if (tasks && tasks instanceof Map && tasks.has(reqID)) {
-            const taskData = tasks.get(reqID);
-            const { type: taskType, callback: taskCallback } = taskData;
-            const taskRespData = getTaskResponseData(taskType, parsedPayload);
-            if (taskRespData == null) taskCallback("error", null);
-            else taskCallback(null, Object.assign({ type: taskType, reqID }, taskRespData));
-          }
+            if (message.lastIssuedSeqId) ctx.lastSeqId = parseInt(message.lastIssuedSeqId);
+            (message.deltas || []).forEach(delta => parseDelta(defaultFuncs, api, ctx, globalCallback, { delta }));
+            break;
+
+          case "/thread_typing":
+          case "/orca_typing_notifications":
+            globalCallback(null, {
+              type: "typ",
+              isTyping: !!message.state,
+              from: message.sender_fbid.toString(),
+              threadID: formatID((message.thread || message.sender_fbid).toString())
+            });
+            break;
+
+          case "/orca_presence":
+            if (!ctx.globalOptions.updatePresence) {
+              (message.list || []).forEach(data => {
+                globalCallback(null, { type: "presence", userID: String(data.u), timestamp: data.l * 1000, statuses: data.p });
+              });
+            }
+            break;
+
+          case "/ls_resp":
+            const parsedPayload = JSON.parse(message.payload);
+            const task = ctx.tasks?.get(message.request_id);
+            if (task) {
+              const resp = getTaskResponseData(task.type, parsedPayload);
+              resp ? task.callback(null, { type: task.type, reqID: message.request_id, ...resp }) : task.callback("error", null);
+            }
+            break;
+
+          default:
+            if (message.type === "jewel_requests_add") {
+              globalCallback(null, { type: "friend_request_received", actorFbId: message.from.toString(), timestamp: Date.now().toString() });
+            }
         }
       } catch (ex) {
-        const errMsg = ex && ex.message ? ex.message : String(ex || "Unknown error");
-        logger(`mqtt message handler error: ${errMsg}`, "error");
-        // Don't crash on message parsing errors, just log and continue
+        logger(`mqtt message error [${topic}]: ${ex.message}`, "error");
       }
     });
-
-    mqttClient.on("close", function () {
-      if (ctx._ending || ctx._cycling) {
-        logger("mqtt close expected", "info");
-        return;
-      }
-      logger("mqtt connection closed", "warn");
-    });
-
-    mqttClient.on("disconnect", () => {
-      if (ctx._ending || ctx._cycling) {
-        logger("mqtt disconnect expected", "info");
-        return;
-      }
-      logger("mqtt disconnected", "warn");
-    });
+    client.on("close", () => !ctx._ending && !ctx._cycling && logger("mqtt connection closed", "warn"));
   };
 };
